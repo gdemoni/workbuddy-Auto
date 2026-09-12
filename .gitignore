@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+WORKBUDDY_ACCESS_TOKEN.txt
+wb_refresh_tokens.json
