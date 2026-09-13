@@ -58,11 +58,14 @@ path = os.path.expanduser(
 with open(path, encoding="utf-8") as file:
     data = json.load(file)
 
-print(
-    f"{data['account']['phoneNumber']}:"
-    f"{data['auth']['accessToken']}:"
-    f"{data['auth']['refreshToken']}"
-)
+phone = str(data["account"]["phoneNumber"])
+result = {
+    phone: {
+        "refresh_token": data["auth"]["refreshToken"],
+        "access_token": data["auth"]["accessToken"],
+    }
+}
+print(json.dumps(result, ensure_ascii=False, indent=2))
 PY
 ```
 
@@ -74,14 +77,30 @@ PY
 打开 PowerShell，完整复制并运行：
 
 ```powershell
+$ErrorActionPreference = "Stop"
 $path = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
 $data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
-"$($data.account.phoneNumber):$($data.auth.accessToken):$($data.auth.refreshToken)"
+$phone = [string]$data.account.phoneNumber
+$result = [ordered]@{}
+$result[$phone] = [ordered]@{
+    refresh_token = [string]$data.auth.refreshToken
+    access_token  = [string]$data.auth.accessToken
+}
+$result | ConvertTo-Json -Depth 3
 ```
 
 </details>
 
-成功后，终端会输出一整行 `手机号:AT:RT`。复制完整一行即可；首次配置多个账号时，每个账号占一行。
+成功后，终端会输出下面这种完整 JSON。从开头的 `{` 到结尾的 `}` 全部复制：
+
+```json
+{
+  "你的手机号": {
+    "refresh_token": "你的 RT",
+    "access_token": "你的 AT"
+  }
+}
+```
 
 > 如果提示文件不存在，请先确认 WorkBuddy 桌面端已经登录，并且已经进入主界面。
 
@@ -100,15 +119,25 @@ Settings
 
 ```text
 Name: WORKBUDDY_REFRESH_TOKEN
-Secret: 手机号:AT:RT
+Secret: 粘贴第 2 步输出的完整 JSON
 ```
 
-多账号示例：
+首次配置多个账号时，把所有账号合并到同一个 JSON 中：
 
-```text
-手机号1:AT1:RT1
-手机号2:AT2:RT2
+```json
+{
+  "手机号1": {
+    "refresh_token": "RT1",
+    "access_token": "AT1"
+  },
+  "手机号2": {
+    "refresh_token": "RT2",
+    "access_token": "AT2"
+  }
+}
 ```
+
+多个账号之间必须加英文逗号 `,`。旧版的 `手机号:AT:RT` 单行格式仍然兼容，但新配置建议直接使用 JSON。
 
 需要微信通知时，可以再添加一个可选 Secret：
 
@@ -162,52 +191,7 @@ Daily
 
 ### 后续添加或更换账号：直接生成 JSON
 
-完成首次环境变量配置并成功运行后，后续不需要再修改 `WORKBUDDY_REFRESH_TOKEN`。登录需要添加或更新的 WorkBuddy 桌面账号，然后运行下面的命令；终端会输出可复制的完整 JSON。
-
-<details>
-<summary><strong>🍎 macOS 输出 JSON 命令</strong></summary>
-
-```bash
-python3 - <<'PY'
-import json
-import os
-
-path = os.path.expanduser(
-    "~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
-)
-with open(path, encoding="utf-8") as file:
-    data = json.load(file)
-
-phone = str(data["account"]["phoneNumber"])
-result = {
-    phone: {
-        "refresh_token": data["auth"]["refreshToken"],
-        "access_token": data["auth"]["accessToken"],
-    }
-}
-print(json.dumps(result, ensure_ascii=False, indent=2))
-PY
-```
-
-</details>
-
-<details>
-<summary><strong>🪟 Windows 输出 JSON 命令</strong></summary>
-
-```powershell
-$ErrorActionPreference = "Stop"
-$path = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
-$data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
-$phone = [string]$data.account.phoneNumber
-$result = [ordered]@{}
-$result[$phone] = [ordered]@{
-    refresh_token = [string]$data.auth.refreshToken
-    access_token  = [string]$data.auth.accessToken
-}
-$result | ConvertTo-Json -Depth 3
-```
-
-</details>
+完成首次环境变量配置并成功运行后，后续不需要再修改 `WORKBUDDY_REFRESH_TOKEN`。登录需要添加或更新的 WorkBuddy 桌面账号，重新运行第 2 步对应的 macOS 或 Windows 命令；终端会直接输出可复制的完整 JSON。
 
 从终端输出开头的 `{` 到结尾的 `}` 全部复制，然后在私有仓库中编辑 `wb_refresh_tokens.json`。
 
