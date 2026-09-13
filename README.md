@@ -15,7 +15,7 @@
 | 🌱 成长任务 | 自动执行成长中心的云端任务 |
 | 🎮 互动玩法 | 支持抽奖、盲盒、Buddy、旅行、连签兑换、补签等玩法 |
 | 🔄 Token 续期 | 自动刷新 Token，并保存最新状态 |
-| 👥 多账号 | 每行填写一个账号即可 |
+| 👥 多账号 | 一个 JSON 文件可保存多个账号 |
 | 📣 消息通知 | 可选 PushPlus 微信通知 |
 
 GitHub Actions 默认在北京时间每天 **07:00、12:00 和 23:30** 自动运行。
@@ -81,13 +81,7 @@ $data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
 
 </details>
 
-成功后，终端会输出一整行：
-
-```text
-手机号:AT:RT
-```
-
-复制完整一行即可。多个账号需要每个账号占一行。
+成功后，终端会输出一整行 `手机号:AT:RT`。复制完整一行即可；首次配置多个账号时，每个账号占一行。
 
 > 如果提示文件不存在，请先确认 WorkBuddy 桌面端已经登录，并且已经进入主界面。
 
@@ -164,7 +158,91 @@ Daily
 → 下次继续使用
 ```
 
-所以正常情况下只需要配置一次。`wb_refresh_tokens.json` 不会放在模板仓库中，只会在使用者自己的私有仓库首次运行后生成。
+所以正常情况下环境变量只需要配置一次。首次成功运行后，工作流会优先读取私有仓库中的 `wb_refresh_tokens.json`，并持续更新它。
+
+### 后续添加或更换账号：直接生成 JSON
+
+完成首次环境变量配置并成功运行后，后续不需要再修改 `WORKBUDDY_REFRESH_TOKEN`。登录需要添加或更新的 WorkBuddy 桌面账号，然后运行下面的命令；终端会输出可复制的完整 JSON。
+
+<details>
+<summary><strong>🍎 macOS 输出 JSON 命令</strong></summary>
+
+```bash
+python3 - <<'PY'
+import json
+import os
+
+path = os.path.expanduser(
+    "~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+)
+with open(path, encoding="utf-8") as file:
+    data = json.load(file)
+
+phone = str(data["account"]["phoneNumber"])
+result = {
+    phone: {
+        "refresh_token": data["auth"]["refreshToken"],
+        "access_token": data["auth"]["accessToken"],
+    }
+}
+print(json.dumps(result, ensure_ascii=False, indent=2))
+PY
+```
+
+</details>
+
+<details>
+<summary><strong>🪟 Windows 输出 JSON 命令</strong></summary>
+
+```powershell
+$ErrorActionPreference = "Stop"
+$path = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
+$data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
+$phone = [string]$data.account.phoneNumber
+$result = [ordered]@{}
+$result[$phone] = [ordered]@{
+    refresh_token = [string]$data.auth.refreshToken
+    access_token  = [string]$data.auth.accessToken
+}
+$result | ConvertTo-Json -Depth 3
+```
+
+</details>
+
+从终端输出开头的 `{` 到结尾的 `}` 全部复制，然后在私有仓库中编辑 `wb_refresh_tokens.json`。
+
+单账号模板：
+
+```json
+{
+  "手机号1": {
+    "refresh_token": "RT1",
+    "access_token": "AT1"
+  }
+}
+```
+
+多账号模板：
+
+```json
+{
+  "手机号1": {
+    "refresh_token": "RT1",
+    "access_token": "AT1"
+  },
+  "手机号2": {
+    "refresh_token": "RT2",
+    "access_token": "AT2"
+  }
+}
+```
+
+> [!IMPORTANT]
+> 多个账号必须写在同一个 JSON 最外层对象中。除最后一个账号外，每个账号结束的 `}` 后都要加英文逗号 `,`。不要把两个带外层 `{}` 的完整 JSON 直接首尾拼接。
+
+添加新账号时保留原有节点并插入新节点；更新同一账号时，只替换对应手机号节点。提交后手动运行一次 `Daily` 验证，日志应显示正确的账号数量。
+
+可参考仓库中的 [`wb_refresh_tokens.example.jsonc`](wb_refresh_tokens.example.jsonc)。它带有说明注释，仅供阅读；实际运行的 `wb_refresh_tokens.json` 必须保持标准 JSON，不能包含 `//` 或 `#` 注释。
 
 ## 📁 仓库里有什么
 
@@ -172,6 +250,7 @@ Daily
 .github/workflows/daily.yml  GitHub Actions 工作流
 daily.py                     主程序
 requirements.txt             Python 依赖
+wb_refresh_tokens.example.jsonc  多账号填写示例（带注释，不参与运行）
 LICENSE                      开源许可证
 ```
 
@@ -179,7 +258,7 @@ LICENSE                      开源许可证
 
 - 从模板创建的运行仓库必须保持 `Private`
 - 不要公开手机号、AT、RT 或 `wb_refresh_tokens.json`
-- 不要把真实 Token 写进 README、代码或工作流文件
+- 真实 Token 只能放在私有仓库的 `wb_refresh_tokens.json`，不要写进 README、脚本或工作流文件
 - 不要让多个仓库同时运行同一个账号，否则 Token 可能互相覆盖
 - 更换仓库前，先停用旧仓库的 Actions
 
