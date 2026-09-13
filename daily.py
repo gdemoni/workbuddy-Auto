@@ -20,7 +20,7 @@
 
 🚀 使用方法（青龙面板三步）
    1. 上传脚本     daily.py
-   2. 设置变量     WORKBUDDY_REFRESH_TOKEN = 完整 JSON（推荐）或每行一个 "手机号:AT:RT"
+   2. 设置变量     WORKBUDDY_REFRESH_TOKEN = 每行一个 "手机号:AT:RT"（多账号换行分隔）
    3. 定时任务     0 7,12 * * *    日常全流程
                   30 23 * * *     夜猫子活动窗口（23:00-08:00）
 
@@ -32,7 +32,7 @@
    python daily.py --only 3      只跑第 3 个账号
 
 🔑 环境变量
-   WORKBUDDY_REFRESH_TOKEN   【必填】多账号 JSON，兼容旧版换行格式
+   WORKBUDDY_REFRESH_TOKEN   【必填】多账号刷新令牌，换行分隔
    PUSHPLUS_TOKEN            【可选】推送通知
 
 获取变量值（首次必看）
@@ -40,20 +40,17 @@
    第二步：登录成功后，用记事本打开下面的文件：
       C:/Users/你的用户名/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
       (AppData 是隐藏文件夹，文件管理器地址栏直接粘贴上面的路径即可)
-   第三步：推荐运行 README 中的系统命令，直接生成完整 JSON：
+   第三步：在文件里搜索 accessToken 和 refreshToken，后面各跟一串很长的
+      eyJ 开头的字符串，那就是 AT 和 RT
+   第四步：按下面的格式拼一行，多个账号就写多行：
 
-      {
-        "1XXXXXXXXXX": {
-          "refresh_token": "RT那串",
-          "access_token": "AT那串"
-        }
-      }
+      手机号:AT那串:RT那串
 
-   第四步：把完整 JSON 保存到 WORKBUDDY_REFRESH_TOKEN。多账号放在同一个
-      最外层对象中，并在相邻账号之间加英文逗号。
+   示例（1个账号写一行，换行分隔）：
+      1XXXXXXXXXX:eyJhbGciOiJSUzI1NiIs...很长...:eyJhbGciOiJIUzUxMiIs...也很长...
+      1XXXXXXXXXX:eyJhbGciOiJSUzI1NiIs...:eyJhbGciOiJIUzUxMiIs...
 
-   旧版的每行 "手机号:AT:RT" 格式仍然兼容。
-
+   ⚠️ 注意：AT 和 RT 之间用英文冒号 : 分隔，等号后面的引号不要带
    ⚠️ RT 是你唯一的续期凭据，泄露了别人就能操作你的账号
 
 📦 任务清单
@@ -183,26 +180,10 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "WORKBUDDY
 
 
 def _parse_env_tokens(raw):
-    """解析环境变量：优先读取 JSON，并兼容旧版换行或 @ 分隔格式。"""
+    """解析环境变量：支持换行或 @ 分隔；每项格式 "手机号:AT:RT" 或 "手机号:RT" 或 纯token"""
     items = []
     if not raw:
         return items
-    stripped = raw.strip()
-    if stripped.startswith("{"):
-        try:
-            store = json.loads(stripped)
-        except (TypeError, ValueError):
-            store = None
-        if isinstance(store, dict):
-            for user, entry in store.items():
-                if not isinstance(entry, dict):
-                    continue
-                at = str(entry.get("access_token", "")).strip()
-                rt = str(entry.get("refresh_token", "")).strip()
-                if rt:
-                    items.append((str(user).strip(), at, rt))
-            if items:
-                return items
     for line in raw.replace("@", "\n").splitlines():
         line = line.strip()
         if not line:
@@ -409,7 +390,7 @@ def load_accounts():
         items = [x.strip() for x in env.replace("@", "\n").splitlines() if x.strip()]
         return [{"note": "账号%d" % (i + 1), "access_token": t}
                 for i, t in enumerate(items)]
-    print("未找到账号：请设置 WORKBUDDY_REFRESH_TOKEN（推荐完整 JSON，兼容每行 手机号:AT:RT）")
+    print("未找到账号：请设置环境变量 WORKBUDDY_REFRESH_TOKEN（每行 手机号:AT:RT）")
     sys.exit(1)
 
 

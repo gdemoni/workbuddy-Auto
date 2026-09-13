@@ -119,25 +119,17 @@ Settings
 
 ```text
 Name: WORKBUDDY_REFRESH_TOKEN
-Secret: 粘贴第 2 步输出的完整 JSON
+Secret: 手机号:AT:RT
 ```
 
-首次配置多个账号时，把所有账号合并到同一个 JSON 中：
+首次配置 Secret 时，按第 2 步 JSON 中的字段，依次填写“手机号、`access_token`、`refresh_token`”；多个账号每行一个：
 
-```json
-{
-  "手机号1": {
-    "refresh_token": "RT1",
-    "access_token": "AT1"
-  },
-  "手机号2": {
-    "refresh_token": "RT2",
-    "access_token": "AT2"
-  }
-}
+```text
+手机号1:AT1:RT1
+手机号2:AT2:RT2
 ```
 
-多个账号之间必须加英文逗号 `,`。旧版的 `手机号:AT:RT` 单行格式仍然兼容，但新配置建议直接使用 JSON。
+这里仍使用旧版环境变量格式；第 2 步命令输出的 JSON 是给后续编辑 `wb_refresh_tokens.json` 使用的，不需要改动 `daily.py`。
 
 需要微信通知时，可以再添加一个可选 Secret：
 
