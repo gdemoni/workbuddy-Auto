@@ -45,7 +45,28 @@ Use this template
 <details>
 <summary><strong>🍎 macOS 获取命令</strong></summary>
 
-打开 Terminal，完整复制并运行：
+打开 Terminal。首次配置 GitHub Secret 时，完整复制并运行下面的命令，它会输出 `手机号:AT:RT`：
+
+```bash
+python3 - <<'PY'
+import json
+import os
+
+path = os.path.expanduser(
+    "~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+)
+with open(path, encoding="utf-8") as file:
+    data = json.load(file)
+
+print(
+    f"{data['account']['phoneNumber']}:"
+    f"{data['auth']['accessToken']}:"
+    f"{data['auth']['refreshToken']}"
+)
+PY
+```
+
+后续添加或更新账号时，运行下面的命令生成完整 JSON：
 
 ```bash
 python3 - <<'PY'
@@ -74,7 +95,16 @@ PY
 <details>
 <summary><strong>🪟 Windows 获取命令</strong></summary>
 
-打开 PowerShell，完整复制并运行：
+打开 PowerShell。首次配置 GitHub Secret 时，完整复制并运行下面的命令，它会输出 `手机号:AT:RT`：
+
+```powershell
+$ErrorActionPreference = "Stop"
+$path = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
+$data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
+"$($data.account.phoneNumber):$($data.auth.accessToken):$($data.auth.refreshToken)"
+```
+
+后续添加或更新账号时，运行下面的命令生成完整 JSON：
 
 ```powershell
 $ErrorActionPreference = "Stop"
@@ -91,7 +121,13 @@ $result | ConvertTo-Json -Depth 3
 
 </details>
 
-成功后，终端会输出下面这种完整 JSON。从开头的 `{` 到结尾的 `}` 全部复制：
+首次配置命令会输出一整行，复制完整一行放入 `WORKBUDDY_REFRESH_TOKEN`；多个账号每个账号占一行：
+
+```text
+手机号:AT:RT
+```
+
+后续维护命令会输出下面这种完整 JSON。从开头的 `{` 到结尾的 `}` 全部复制，用于编辑 `wb_refresh_tokens.json`：
 
 ```json
 {
@@ -122,14 +158,14 @@ Name: WORKBUDDY_REFRESH_TOKEN
 Secret: 手机号:AT:RT
 ```
 
-首次配置 Secret 时，按第 2 步 JSON 中的字段，依次填写“手机号、`access_token`、`refresh_token`”；多个账号每行一个：
+首次配置 Secret 时，直接复制第 2 步“首次配置”命令输出的完整一行；多个账号每行一个：
 
 ```text
 手机号1:AT1:RT1
 手机号2:AT2:RT2
 ```
 
-这里仍使用旧版环境变量格式；第 2 步命令输出的 JSON 是给后续编辑 `wb_refresh_tokens.json` 使用的，不需要改动 `daily.py`。
+这里仍使用旧版环境变量格式；第 2 步“后续维护”命令输出的 JSON 是给编辑 `wb_refresh_tokens.json` 使用的，不需要改动 `daily.py`。
 
 需要微信通知时，可以再添加一个可选 Secret：
 
