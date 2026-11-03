@@ -40,50 +40,331 @@ Use this template
 
 ### 2. 获取 Token
 
-先在电脑上安装并登录 WorkBuddy，进入主界面后再运行对应命令。
+先在电脑上安装并登录 WorkBuddy，进入主界面后再运行对应命令。按提示填写**当前登录账号的手机号**。
+
+每个系统都有两段**独立运行**的完整命令：首次配置输出 `手机号:AT:RT`；后续维护输出 JSON。两段命令都会自行读取本机凭据，兼容明文及受支持的 `$wbEncrypted / suite 1` 加密字段，不依赖另一段命令或剪贴板已有内容。
+
+命令只读取认证文件，不修改客户端登录状态、不发送网络请求。加密字段通过本机 WorkBuddy 客户端运行时处理；其他客户端版本可能需要进一步适配。提取成功不代表已通过服务端有效性验证。
 
 <details>
 <summary><strong>🍎 macOS 获取命令</strong></summary>
 
-打开 Terminal。首次配置 GitHub Secret 时，完整复制并运行下面的命令，它会输出 `手机号:AT:RT`：
+打开 Terminal，确认有 Python 3。完整复制需要的代码块，包含第一行 `python3 - <<'PY'` 和最后一行 `PY`。
+
+**首次配置 GitHub Secret：输出 `手机号:AT:RT`**
 
 ```bash
 python3 - <<'PY'
 import json
 import os
+import plistlib
+import re
+import subprocess
+import sys
+from pathlib import Path
 
-path = os.path.expanduser(
-    "~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
-)
-with open(path, encoding="utf-8") as file:
-    data = json.load(file)
+def fail(msg):
+    sys.exit("提取失败：" + msg)
 
-print(
-    f"{data['account']['phoneNumber']}:"
-    f"{data['auth']['accessToken']}:"
-    f"{data['auth']['refreshToken']}"
-)
+try:
+    with open("/dev/tty", "w") as tty:
+        tty.write("请输入当前 WorkBuddy 账号的手机号：")
+        tty.flush()
+    with open("/dev/tty", "r") as tty:
+        phone = tty.readline().strip()
+except OSError:
+    fail("无法读取手机号，请在 Mac 终端运行。")
+if not re.fullmatch(r"\+?[0-9]{5,20}", phone):
+    fail("手机号为空或格式不正确。")
+
+path = Path.home() / "Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    fail("无法读取认证文件，请先登录 WorkBuddy。")
+auth = data.get("auth") or {}
+values = {}
+for field in ("accessToken", "refreshToken"):
+    top = data.get(field)
+    values[field] = top if isinstance(top, str) and top else auth.get(field)
+    if values[field] is None:
+        fail("认证文件缺少 " + field)
+
+js = r"""
+const crypto = require('crypto');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', s => input += s);
+process.stdin.on('end', () => {
+  let key;
+  try {
+    function decrypt(v) {
+      if (typeof v === 'string') return v;
+      if (!v || v.$wbEncrypted !== 1) throw Error('UNSUPPORTED_FORMAT');
+      const e = JSON.parse(Buffer.from(v.envelope,'base64').toString('utf8'));
+      if (e.suite !== 1) throw Error('UNSUPPORTED_SUITE');
+      if (!key) {
+        const p = JSON.parse(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet());
+        if (p.version !== 1 || typeof p.atRestSecretKey !== 'string')
+          throw Error('RUNTIME_UNAVAILABLE');
+        key = crypto.createHash('sha256').update(p.atRestSecretKey,'utf8').digest();
+      }
+      if (crypto.createHash('sha256').update(key).digest('hex').slice(0,16) !== e.keyId)
+        throw Error('KEY_MISMATCH');
+      function lp(s) {
+        const b = Buffer.from(s,'utf8'), n = Buffer.alloc(4);
+        n.writeUInt32BE(b.length);
+        return Buffer.concat([n,b]);
+      }
+      const aad = Buffer.concat([
+        Buffer.from('WB-AAD\0','ascii'), Buffer.from([1]),
+        lp('WBEV1'), lp('sym-v1'), Buffer.from([0,0,0,1]),
+        lp(e.keyId), Buffer.from([2,0,0])
+      ]);
+      const c = crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(e.nonce,'base64'),{authTagLength:16});
+      c.setAAD(aad);
+      c.setAuthTag(Buffer.from(e.authTag,'base64'));
+      const plain = Buffer.concat([c.update(Buffer.from(e.ciphertext,'base64')),c.final()]);
+      try { return plain.toString('utf8'); }
+      finally { plain.fill(0); }
+    }
+    const result = {};
+    for (const [k,v] of Object.entries(JSON.parse(input))) result[k] = decrypt(v);
+    process.stdout.write(JSON.stringify({ok:true,result}));
+  } catch (e) {
+    const allowed = ['UNSUPPORTED_FORMAT','UNSUPPORTED_SUITE','RUNTIME_UNAVAILABLE','KEY_MISMATCH'];
+    process.stdout.write(JSON.stringify({
+      ok:false,error:allowed.includes(e.message) ? e.message : 'DECRYPT_FAILED'
+    }));
+  } finally {
+    if (key) key.fill(0);
+  }
+});
+"""
+
+if any(not isinstance(v, str) for v in values.values()):
+    executables = []
+    override = os.environ.get("WORKBUDDY_EXE")
+    if override:
+        executables.append(Path(override).expanduser())
+    else:
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            for bundle in root.glob("*.app"):
+                if "workbuddy" not in bundle.name.lower():
+                    continue
+                try:
+                    with (bundle / "Contents/Info.plist").open("rb") as f:
+                        name = plistlib.load(f)["CFBundleExecutable"]
+                    if Path(name).name == name:
+                        executables.append(bundle / "Contents/MacOS" / name)
+                except Exception:
+                    pass
+    executables = [p for p in executables if p.is_file()]
+    if not executables:
+        fail("未找到 WorkBuddy 客户端。")
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    errors = []
+    for exe in executables:
+        try:
+            proc = subprocess.run(
+                [str(exe), "-e", js], input=json.dumps(values),
+                text=True, capture_output=True, env=env, timeout=20
+            )
+            result = json.loads(proc.stdout)
+            if result.get("ok"):
+                values = result["result"]
+                break
+            errors.append(result.get("error", "UNKNOWN"))
+        except subprocess.TimeoutExpired:
+            errors.append("TIMEOUT")
+        except Exception:
+            errors.append("RUNTIME_UNAVAILABLE")
+    else:
+        fail("解密未成功：" + ", ".join(errors))
+
+def normalize(v):
+    if not isinstance(v, str):
+        return ""
+    v = v.strip()
+    for _ in range(2):
+        try:
+            decoded = json.loads(v)
+        except (ValueError, TypeError):
+            break
+        if not isinstance(decoded, str):
+            break
+        v = decoded.strip()
+    return v
+
+at = normalize(values["accessToken"])
+rt = normalize(values["refreshToken"])
+for name, value in (("AT", at), ("RT", rt)):
+    if not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", value):
+        fail(name + " 为空或格式异常，未输出凭据。")
+
+print(f"{phone}:{at}:{rt}")
 PY
 ```
 
-后续添加或更新账号时，运行下面的命令生成完整 JSON：
+**后续添加或更新账号：输出完整 JSON**
+
+下面这段命令可独立运行，将输出用于编辑 `wb_refresh_tokens.json`。
 
 ```bash
 python3 - <<'PY'
 import json
 import os
+import plistlib
+import re
+import subprocess
+import sys
+from pathlib import Path
 
-path = os.path.expanduser(
-    "~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
-)
-with open(path, encoding="utf-8") as file:
-    data = json.load(file)
+def fail(msg):
+    sys.exit("提取失败：" + msg)
 
-phone = str(data["account"]["phoneNumber"])
+try:
+    with open("/dev/tty", "w") as tty:
+        tty.write("请输入当前 WorkBuddy 账号的手机号：")
+        tty.flush()
+    with open("/dev/tty", "r") as tty:
+        phone = tty.readline().strip()
+except OSError:
+    fail("无法读取手机号，请在 Mac 终端运行。")
+if not re.fullmatch(r"\+?[0-9]{5,20}", phone):
+    fail("手机号为空或格式不正确。")
+
+path = Path.home() / "Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    fail("无法读取认证文件，请先登录 WorkBuddy。")
+auth = data.get("auth") or {}
+values = {}
+for field in ("accessToken", "refreshToken"):
+    top = data.get(field)
+    values[field] = top if isinstance(top, str) and top else auth.get(field)
+    if values[field] is None:
+        fail("认证文件缺少 " + field)
+
+js = r"""
+const crypto = require('crypto');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', s => input += s);
+process.stdin.on('end', () => {
+  let key;
+  try {
+    function decrypt(v) {
+      if (typeof v === 'string') return v;
+      if (!v || v.$wbEncrypted !== 1) throw Error('UNSUPPORTED_FORMAT');
+      const e = JSON.parse(Buffer.from(v.envelope,'base64').toString('utf8'));
+      if (e.suite !== 1) throw Error('UNSUPPORTED_SUITE');
+      if (!key) {
+        const p = JSON.parse(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet());
+        if (p.version !== 1 || typeof p.atRestSecretKey !== 'string')
+          throw Error('RUNTIME_UNAVAILABLE');
+        key = crypto.createHash('sha256').update(p.atRestSecretKey,'utf8').digest();
+      }
+      if (crypto.createHash('sha256').update(key).digest('hex').slice(0,16) !== e.keyId)
+        throw Error('KEY_MISMATCH');
+      function lp(s) {
+        const b = Buffer.from(s,'utf8'), n = Buffer.alloc(4);
+        n.writeUInt32BE(b.length);
+        return Buffer.concat([n,b]);
+      }
+      const aad = Buffer.concat([
+        Buffer.from('WB-AAD\0','ascii'), Buffer.from([1]),
+        lp('WBEV1'), lp('sym-v1'), Buffer.from([0,0,0,1]),
+        lp(e.keyId), Buffer.from([2,0,0])
+      ]);
+      const c = crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(e.nonce,'base64'),{authTagLength:16});
+      c.setAAD(aad);
+      c.setAuthTag(Buffer.from(e.authTag,'base64'));
+      const plain = Buffer.concat([c.update(Buffer.from(e.ciphertext,'base64')),c.final()]);
+      try { return plain.toString('utf8'); }
+      finally { plain.fill(0); }
+    }
+    const result = {};
+    for (const [k,v] of Object.entries(JSON.parse(input))) result[k] = decrypt(v);
+    process.stdout.write(JSON.stringify({ok:true,result}));
+  } catch (e) {
+    const allowed = ['UNSUPPORTED_FORMAT','UNSUPPORTED_SUITE','RUNTIME_UNAVAILABLE','KEY_MISMATCH'];
+    process.stdout.write(JSON.stringify({
+      ok:false,error:allowed.includes(e.message) ? e.message : 'DECRYPT_FAILED'
+    }));
+  } finally {
+    if (key) key.fill(0);
+  }
+});
+"""
+
+if any(not isinstance(v, str) for v in values.values()):
+    executables = []
+    override = os.environ.get("WORKBUDDY_EXE")
+    if override:
+        executables.append(Path(override).expanduser())
+    else:
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            for bundle in root.glob("*.app"):
+                if "workbuddy" not in bundle.name.lower():
+                    continue
+                try:
+                    with (bundle / "Contents/Info.plist").open("rb") as f:
+                        name = plistlib.load(f)["CFBundleExecutable"]
+                    if Path(name).name == name:
+                        executables.append(bundle / "Contents/MacOS" / name)
+                except Exception:
+                    pass
+    executables = [p for p in executables if p.is_file()]
+    if not executables:
+        fail("未找到 WorkBuddy 客户端。")
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    errors = []
+    for exe in executables:
+        try:
+            proc = subprocess.run(
+                [str(exe), "-e", js], input=json.dumps(values),
+                text=True, capture_output=True, env=env, timeout=20
+            )
+            result = json.loads(proc.stdout)
+            if result.get("ok"):
+                values = result["result"]
+                break
+            errors.append(result.get("error", "UNKNOWN"))
+        except subprocess.TimeoutExpired:
+            errors.append("TIMEOUT")
+        except Exception:
+            errors.append("RUNTIME_UNAVAILABLE")
+    else:
+        fail("解密未成功：" + ", ".join(errors))
+
+def normalize(v):
+    if not isinstance(v, str):
+        return ""
+    v = v.strip()
+    for _ in range(2):
+        try:
+            decoded = json.loads(v)
+        except (ValueError, TypeError):
+            break
+        if not isinstance(decoded, str):
+            break
+        v = decoded.strip()
+    return v
+
+at = normalize(values["accessToken"])
+rt = normalize(values["refreshToken"])
+for name, value in (("AT", at), ("RT", rt)):
+    if not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", value):
+        fail(name + " 为空或格式异常，未输出凭据。")
+
 result = {
     phone: {
-        "refresh_token": data["auth"]["refreshToken"],
-        "access_token": data["auth"]["accessToken"],
+        "refresh_token": rt,
+        "access_token": at
     }
 }
 print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -95,28 +376,397 @@ PY
 <details>
 <summary><strong>🪟 Windows 获取命令</strong></summary>
 
-打开 PowerShell。首次配置 GitHub Secret 时，完整复制并运行下面的命令，它会输出 `手机号:AT:RT`：
+打开 **PowerShell（不是 CMD）**，完整复制需要的代码块运行。不需要另装 Python 或 Node.js。成功后显示结果并尝试复制到剪贴板；自动复制失败时可手动复制输出。
+
+**首次配置 GitHub Secret：输出 `手机号:AT:RT`**
 
 ```powershell
-$ErrorActionPreference = "Stop"
-$path = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
-$data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
-"$($data.account.phoneNumber):$($data.auth.accessToken):$($data.auth.refreshToken)"
+& {
+    $ErrorActionPreference = "Stop"
+    try {
+        $phone = (Read-Host "请输入当前 WorkBuddy 账号的手机号").Trim()
+        if ($phone -notmatch '^\+?[0-9]{5,20}$') {
+            throw "手机号格式不正确"
+        }
+        $path = Join-Path $env:LOCALAPPDATA "CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "找不到认证文件，请先登录 WorkBuddy"
+        }
+        $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $tokens = @{}
+        foreach ($name in @("accessToken", "refreshToken")) {
+            if ($data.$name -is [string] -and $data.$name) {
+                $tokens[$name] = $data.$name
+            } else {
+                $tokens[$name] = $data.auth.$name
+            }
+            if ($null -eq $tokens[$name]) { throw "认证文件缺少 $name" }
+        }
+
+        $js = @'
+const crypto = require('crypto');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', s => input += s);
+process.stdin.on('end', () => {
+  let key;
+  try {
+    function decrypt(v) {
+      if (typeof v === 'string') return v;
+      if (!v || v.$wbEncrypted !== 1) throw Error('UNSUPPORTED_FORMAT');
+      const e = JSON.parse(Buffer.from(v.envelope,'base64').toString('utf8'));
+      if (e.suite !== 1) throw Error('UNSUPPORTED_SUITE');
+      if (!key) {
+        const p = JSON.parse(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet());
+        if (p.version !== 1 || typeof p.atRestSecretKey !== 'string')
+          throw Error('RUNTIME_UNAVAILABLE');
+        key = crypto.createHash('sha256').update(p.atRestSecretKey,'utf8').digest();
+      }
+      if (crypto.createHash('sha256').update(key).digest('hex').slice(0,16) !== e.keyId)
+        throw Error('KEY_MISMATCH');
+      function lp(s) {
+        const b = Buffer.from(s,'utf8'), n = Buffer.alloc(4);
+        n.writeUInt32BE(b.length);
+        return Buffer.concat([n,b]);
+      }
+      const aad = Buffer.concat([
+        Buffer.from('WB-AAD\0','ascii'), Buffer.from([1]),
+        lp('WBEV1'), lp('sym-v1'), Buffer.from([0,0,0,1]),
+        lp(e.keyId), Buffer.from([2,0,0])
+      ]);
+      const c = crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(e.nonce,'base64'),{authTagLength:16});
+      c.setAAD(aad);
+      c.setAuthTag(Buffer.from(e.authTag,'base64'));
+      const plain = Buffer.concat([c.update(Buffer.from(e.ciphertext,'base64')),c.final()]);
+      try { return plain.toString('utf8'); }
+      finally { plain.fill(0); }
+    }
+    const result = {};
+    for (const [k,v] of Object.entries(JSON.parse(input))) result[k] = decrypt(v);
+    process.stdout.write(JSON.stringify({ok:true,result}));
+  } catch (e) {
+    const allowed = ['UNSUPPORTED_FORMAT','UNSUPPORTED_SUITE','RUNTIME_UNAVAILABLE','KEY_MISMATCH'];
+    process.stdout.write(JSON.stringify({
+      ok:false,error:allowed.includes(e.message) ? e.message : 'DECRYPT_FAILED'
+    }));
+  } finally {
+    if (key) key.fill(0);
+  }
+});
+'@
+
+        $encrypted = @($tokens.Values | Where-Object { $_ -isnot [string] }).Count -gt 0
+        if ($encrypted) {
+            $paths = @()
+            if ($env:WORKBUDDY_EXE) {
+                $paths += $env:WORKBUDDY_EXE
+            } else {
+                $paths += @(
+                    "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe"
+                    "$env:LOCALAPPDATA\WorkBuddy\WorkBuddy.exe"
+                    "$env:ProgramFiles\WorkBuddy\WorkBuddy.exe"
+                    "${env:ProgramFiles(x86)}\WorkBuddy\WorkBuddy.exe"
+                )
+                foreach ($root in @(
+                    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                )) {
+                    foreach ($app in (Get-ItemProperty $root -ErrorAction SilentlyContinue)) {
+                        if ($app.DisplayName -notlike "*WorkBuddy*") { continue }
+                        if ($app.InstallLocation) {
+                            $paths += Join-Path $app.InstallLocation "WorkBuddy.exe"
+                        }
+                        if ($app.DisplayIcon) {
+                            $icon = ([string]$app.DisplayIcon -replace ',\s*-?\d+\s*$', '').Trim().Trim('"')
+                            if ([IO.Path]::GetFileName($icon) -ieq "WorkBuddy.exe") {
+                                $paths += $icon
+                            }
+                        }
+                    }
+                }
+            }
+            $paths = @($paths | Where-Object {
+                Test-Path -LiteralPath $_ -PathType Leaf
+            } | Select-Object -Unique)
+            if ($paths.Count -eq 0) {
+                throw '找不到客户端。先运行 $env:WORKBUDDY_EXE="D:\实际路径\WorkBuddy.exe"，再重新运行整段代码'
+            }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($js))
+            $payload = $tokens | ConvertTo-Json -Depth 10 -Compress
+            $success = $false
+            $errors = @()
+            foreach ($exe in $paths) {
+                $process = New-Object System.Diagnostics.Process
+                try {
+                    $info = New-Object System.Diagnostics.ProcessStartInfo
+                    $info.FileName = $exe
+                    $info.Arguments = '-e "eval(Buffer.from(''' + $encoded + ''',''base64'').toString(''utf8''))"'
+                    $info.UseShellExecute = $false
+                    $info.CreateNoWindow = $true
+                    $info.RedirectStandardInput = $true
+                    $info.RedirectStandardOutput = $true
+                    $info.RedirectStandardError = $true
+                    $info.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1"
+                    $process.StartInfo = $info
+                    [void]$process.Start()
+                    $outTask = $process.StandardOutput.ReadToEndAsync()
+                    $errTask = $process.StandardError.ReadToEndAsync()
+                    $process.StandardInput.Write($payload)
+                    $process.StandardInput.Close()
+                    if (-not $process.WaitForExit(20000)) {
+                        $process.Kill()
+                        $errors += "TIMEOUT"
+                        continue
+                    }
+                    $reply = $outTask.GetAwaiter().GetResult() | ConvertFrom-Json
+                    [void]$errTask.GetAwaiter().GetResult()
+                    if ($reply.ok) {
+                        $tokens = @{
+                            accessToken = $reply.result.accessToken
+                            refreshToken = $reply.result.refreshToken
+                        }
+                        $success = $true
+                        break
+                    }
+                    $errors += [string]$reply.error
+                } catch {
+                    $errors += "RUNTIME_UNAVAILABLE"
+                } finally {
+                    $process.Dispose()
+                }
+            }
+            if (-not $success) { throw ("解密失败：" + ($errors -join ", ")) }
+        }
+
+        foreach ($name in @("accessToken", "refreshToken")) {
+            $v = $tokens[$name]
+            if ($v -isnot [string]) { throw "$name 类型异常" }
+            $v = $v.Trim()
+            for ($i = 0; $i -lt 2; $i++) {
+                try {
+                    $decoded = ConvertFrom-Json -InputObject $v -ErrorAction Stop
+                    if ($decoded -isnot [string]) { break }
+                    $v = $decoded.Trim()
+                } catch { break }
+            }
+            if (-not $v -or $v -cnotmatch '^[A-Za-z0-9._~+/-]+=*$') {
+                throw "$name 为空或格式异常"
+            }
+            $tokens[$name] = $v
+        }
+
+        $text = "{0}:{1}:{2}" -f $phone, $tokens["accessToken"], $tokens["refreshToken"]
+        Write-Output $text
+        try {
+            Set-Clipboard -Value $text -ErrorAction Stop
+            Write-Host "已复制到剪贴板，可以直接粘贴到 GitHub Secret。" -ForegroundColor Green
+        } catch {
+            Write-Host "自动复制失败，请手动复制上面的输出。" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host ("提取失败：" + $_.Exception.Message) -ForegroundColor Red
+    }
+}
 ```
 
-后续添加或更新账号时，运行下面的命令生成完整 JSON：
+**后续添加或更新账号：输出完整 JSON**
+
+下面这段命令同样可独立运行，不需要先执行首次配置命令。
 
 ```powershell
-$ErrorActionPreference = "Stop"
-$path = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
-$data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
-$phone = [string]$data.account.phoneNumber
-$result = [ordered]@{}
-$result[$phone] = [ordered]@{
-    refresh_token = [string]$data.auth.refreshToken
-    access_token  = [string]$data.auth.accessToken
+& {
+    $ErrorActionPreference = "Stop"
+    try {
+        $phone = (Read-Host "请输入当前 WorkBuddy 账号的手机号").Trim()
+        if ($phone -notmatch '^\+?[0-9]{5,20}$') {
+            throw "手机号格式不正确"
+        }
+        $path = Join-Path $env:LOCALAPPDATA "CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "找不到认证文件，请先登录 WorkBuddy"
+        }
+        $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $tokens = @{}
+        foreach ($name in @("accessToken", "refreshToken")) {
+            if ($data.$name -is [string] -and $data.$name) {
+                $tokens[$name] = $data.$name
+            } else {
+                $tokens[$name] = $data.auth.$name
+            }
+            if ($null -eq $tokens[$name]) { throw "认证文件缺少 $name" }
+        }
+
+        $js = @'
+const crypto = require('crypto');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', s => input += s);
+process.stdin.on('end', () => {
+  let key;
+  try {
+    function decrypt(v) {
+      if (typeof v === 'string') return v;
+      if (!v || v.$wbEncrypted !== 1) throw Error('UNSUPPORTED_FORMAT');
+      const e = JSON.parse(Buffer.from(v.envelope,'base64').toString('utf8'));
+      if (e.suite !== 1) throw Error('UNSUPPORTED_SUITE');
+      if (!key) {
+        const p = JSON.parse(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet());
+        if (p.version !== 1 || typeof p.atRestSecretKey !== 'string')
+          throw Error('RUNTIME_UNAVAILABLE');
+        key = crypto.createHash('sha256').update(p.atRestSecretKey,'utf8').digest();
+      }
+      if (crypto.createHash('sha256').update(key).digest('hex').slice(0,16) !== e.keyId)
+        throw Error('KEY_MISMATCH');
+      function lp(s) {
+        const b = Buffer.from(s,'utf8'), n = Buffer.alloc(4);
+        n.writeUInt32BE(b.length);
+        return Buffer.concat([n,b]);
+      }
+      const aad = Buffer.concat([
+        Buffer.from('WB-AAD\0','ascii'), Buffer.from([1]),
+        lp('WBEV1'), lp('sym-v1'), Buffer.from([0,0,0,1]),
+        lp(e.keyId), Buffer.from([2,0,0])
+      ]);
+      const c = crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(e.nonce,'base64'),{authTagLength:16});
+      c.setAAD(aad);
+      c.setAuthTag(Buffer.from(e.authTag,'base64'));
+      const plain = Buffer.concat([c.update(Buffer.from(e.ciphertext,'base64')),c.final()]);
+      try { return plain.toString('utf8'); }
+      finally { plain.fill(0); }
+    }
+    const result = {};
+    for (const [k,v] of Object.entries(JSON.parse(input))) result[k] = decrypt(v);
+    process.stdout.write(JSON.stringify({ok:true,result}));
+  } catch (e) {
+    const allowed = ['UNSUPPORTED_FORMAT','UNSUPPORTED_SUITE','RUNTIME_UNAVAILABLE','KEY_MISMATCH'];
+    process.stdout.write(JSON.stringify({
+      ok:false,error:allowed.includes(e.message) ? e.message : 'DECRYPT_FAILED'
+    }));
+  } finally {
+    if (key) key.fill(0);
+  }
+});
+'@
+
+        $encrypted = @($tokens.Values | Where-Object { $_ -isnot [string] }).Count -gt 0
+        if ($encrypted) {
+            $paths = @()
+            if ($env:WORKBUDDY_EXE) {
+                $paths += $env:WORKBUDDY_EXE
+            } else {
+                $paths += @(
+                    "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe"
+                    "$env:LOCALAPPDATA\WorkBuddy\WorkBuddy.exe"
+                    "$env:ProgramFiles\WorkBuddy\WorkBuddy.exe"
+                    "${env:ProgramFiles(x86)}\WorkBuddy\WorkBuddy.exe"
+                )
+                foreach ($root in @(
+                    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                )) {
+                    foreach ($app in (Get-ItemProperty $root -ErrorAction SilentlyContinue)) {
+                        if ($app.DisplayName -notlike "*WorkBuddy*") { continue }
+                        if ($app.InstallLocation) {
+                            $paths += Join-Path $app.InstallLocation "WorkBuddy.exe"
+                        }
+                        if ($app.DisplayIcon) {
+                            $icon = ([string]$app.DisplayIcon -replace ',\s*-?\d+\s*$', '').Trim().Trim('"')
+                            if ([IO.Path]::GetFileName($icon) -ieq "WorkBuddy.exe") {
+                                $paths += $icon
+                            }
+                        }
+                    }
+                }
+            }
+            $paths = @($paths | Where-Object {
+                Test-Path -LiteralPath $_ -PathType Leaf
+            } | Select-Object -Unique)
+            if ($paths.Count -eq 0) {
+                throw '找不到客户端。先运行 $env:WORKBUDDY_EXE="D:\实际路径\WorkBuddy.exe"，再重新运行整段代码'
+            }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($js))
+            $payload = $tokens | ConvertTo-Json -Depth 10 -Compress
+            $success = $false
+            $errors = @()
+            foreach ($exe in $paths) {
+                $process = New-Object System.Diagnostics.Process
+                try {
+                    $info = New-Object System.Diagnostics.ProcessStartInfo
+                    $info.FileName = $exe
+                    $info.Arguments = '-e "eval(Buffer.from(''' + $encoded + ''',''base64'').toString(''utf8''))"'
+                    $info.UseShellExecute = $false
+                    $info.CreateNoWindow = $true
+                    $info.RedirectStandardInput = $true
+                    $info.RedirectStandardOutput = $true
+                    $info.RedirectStandardError = $true
+                    $info.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1"
+                    $process.StartInfo = $info
+                    [void]$process.Start()
+                    $outTask = $process.StandardOutput.ReadToEndAsync()
+                    $errTask = $process.StandardError.ReadToEndAsync()
+                    $process.StandardInput.Write($payload)
+                    $process.StandardInput.Close()
+                    if (-not $process.WaitForExit(20000)) {
+                        $process.Kill()
+                        $errors += "TIMEOUT"
+                        continue
+                    }
+                    $reply = $outTask.GetAwaiter().GetResult() | ConvertFrom-Json
+                    [void]$errTask.GetAwaiter().GetResult()
+                    if ($reply.ok) {
+                        $tokens = @{
+                            accessToken = $reply.result.accessToken
+                            refreshToken = $reply.result.refreshToken
+                        }
+                        $success = $true
+                        break
+                    }
+                    $errors += [string]$reply.error
+                } catch {
+                    $errors += "RUNTIME_UNAVAILABLE"
+                } finally {
+                    $process.Dispose()
+                }
+            }
+            if (-not $success) { throw ("解密失败：" + ($errors -join ", ")) }
+        }
+
+        foreach ($name in @("accessToken", "refreshToken")) {
+            $v = $tokens[$name]
+            if ($v -isnot [string]) { throw "$name 类型异常" }
+            $v = $v.Trim()
+            for ($i = 0; $i -lt 2; $i++) {
+                try {
+                    $decoded = ConvertFrom-Json -InputObject $v -ErrorAction Stop
+                    if ($decoded -isnot [string]) { break }
+                    $v = $decoded.Trim()
+                } catch { break }
+            }
+            if (-not $v -or $v -cnotmatch '^[A-Za-z0-9._~+/-]+=*$') {
+                throw "$name 为空或格式异常"
+            }
+            $tokens[$name] = $v
+        }
+
+        $result = [ordered]@{}
+        $result[$phone] = [ordered]@{
+            refresh_token = $tokens["refreshToken"]
+            access_token = $tokens["accessToken"]
+        }
+        $text = $result | ConvertTo-Json -Depth 5
+        Write-Output $text
+        try {
+            Set-Clipboard -Value $text -ErrorAction Stop
+            Write-Host "JSON 已复制到剪贴板，可以直接粘贴。" -ForegroundColor Green
+        } catch {
+            Write-Host "自动复制失败，请手动复制上面的输出。" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host ("提取失败：" + $_.Exception.Message) -ForegroundColor Red
+    }
 }
-$result | ConvertTo-Json -Depth 3
 ```
 
 </details>
@@ -138,7 +788,9 @@ $result | ConvertTo-Json -Depth 3
 }
 ```
 
-> 如果提示文件不存在，请先确认 WorkBuddy 桌面端已经登录，并且已经进入主界面。
+> 如果提示文件不存在，请先确认 WorkBuddy 桌面端已经登录，并且已经进入主界面。`KEY_MISMATCH` 表示所选客户端与凭据不匹配；`RUNTIME_UNAVAILABLE` 或 `DECRYPT_FAILED` 表示需要检查客户端路径、版本或格式支持。只反馈错误代码，不要公开真实 Token。
+>
+> JSON 中不填写 `updated`，由签到脚本刷新成功后维护。编辑多账号文件时，只添加或替换对应手机号节点，保留其他账号。
 
 ### 3. 把 Token 放进 GitHub Secret
 
