@@ -6,7 +6,7 @@
 
 📌 这是什么
    一个脚本搞定 WorkBuddy 成长中心全部自动化：Token 自动续期、积分/用量查询、
-   18 项成长任务、8 项互动玩法、自动领奖，全部无人值守。
+   成长任务（含6项指定专家体验）、8 项互动玩法、自动领奖，全部无人值守。
 
 ✨ 特性
    🔐 Token 永续     只配一个刷新令牌变量，脚本自动续期（90 天滚动，永不过期）
@@ -1262,19 +1262,282 @@ def t_workstation(s, uid, nick, log, tok):
     log("   工作台搭建师: %s %s/%s" % prog(s, "workstation_expert"))
 
 
+# 指定专家体验任务：仅在真实对话成功后上报，不构造服务端消息 ID。
+# 专家 ID/版本参考 sgltlj/WBD (MIT)，任务官方深链中的 ID 优先。
+EXPERT_EXPERIENCE_TASKS = {
+    "Expert_lighthouse": {"id": "ex_2cvvUZQhDyeJ", "name": "腾讯轻量云专家", "version": "1.0.2"},
+    "WorkBuddy_Valorant": {"id": "ex_xQHHD1u5Jkua", "name": "无畏契约拼豆专家", "version": "1.2.1"},
+    "expert_use_maidehao": {"id": "ex_GDl31WahyIH0", "name": "卖得好", "profession": "中国电商运营专家", "version": "1.0.1"},
+    "expert_use_douyinyin": {"id": "ex_FbY5nlWTqDod", "name": "斗音音", "profession": "抖音策略师", "version": "1.0.2"},
+    "expert_use_shangjia_xuanchuan": {"id": "ex_Weo3x2EZuSDm", "name": "商家宣传设计师", "profession": "商家宣传页与海报设计师", "version": "1.6.0"},
+    "expert_use_bowangwang": {"id": "ex_WZY136wV5aMt", "name": "播旺旺", "profession": "直播电商教练", "version": "1.0.2"},
+}
+
+
+def experience_expert_id(value):
+    """只解析官方链接或 workbuddy://experts 深链，不请求跳转地址。"""
+    import re
+    from urllib.parse import urlparse, parse_qs
+    if not isinstance(value, str):
+        return ""
+    try:
+        parsed = urlparse(value.strip())
+        if parsed.fragment or parsed.username or parsed.password:
+            return ""
+        if parsed.scheme == "workbuddy" and parsed.netloc == "experts" and parsed.path in ("", "/"):
+            ids = parse_qs(parsed.query).get("expertId", [])
+            return ids[0] if len(ids) == 1 and re.fullmatch(r"ex_[A-Za-z0-9]{6,64}", ids[0]) else ""
+        if parsed.scheme not in ("https", "http"):
+            return ""
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not any(host == domain or host.endswith("." + domain)
+                   for domain in ("workbuddy.cn", "codebuddy.cn", "tencent.com")):
+            return ""
+        links = parse_qs(parsed.query).get("deeplink", [])
+        if len(links) == 1 and links[0].startswith("workbuddy://experts"):
+            return experience_expert_id(links[0])
+    except (ValueError, TypeError):
+        pass
+    return ""
+
+
+def experience_task_available(task, now=None):
+    """按服务端开放时间过滤；日期不明确时跳过，避免误发付费对话。"""
+    import datetime
+    if task.get("accept_status") in ("completed", "claimed"):
+        return False, "已完成"
+    if task.get("locked"):
+        return False, "尚未解锁"
+    now = time.time() if now is None else now
+    for field, is_end in (("valid_start", False), ("valid_end", True)):
+        raw = task.get(field)
+        if raw in (None, ""):
+            continue
+        try:
+            value = str(raw).strip()
+            if isinstance(raw, (int, float)) or value.replace(".", "", 1).isdigit():
+                timestamp = float(raw)
+                if timestamp <= 0:
+                    continue
+                if timestamp > 1e11:
+                    timestamp /= 1000
+            else:
+                date = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+                if len(value) == 10 and is_end:
+                    date += datetime.timedelta(days=1)
+                timestamp = date.timestamp()
+            if not is_end and now < timestamp:
+                return False, "尚未开放"
+            if is_end and now >= timestamp:
+                return False, "活动已结束"
+        except (ValueError, TypeError, OverflowError):
+            return False, "活动时间格式无法识别"
+    return True, ""
+
+
+def resolve_experience_expert(s, task):
+    """任务深链优先；搜索市场按 ID 精确匹配，未知任务仅接受唯一同名专家。"""
+    code = task.get("task_code", "")
+    spec = dict(EXPERT_EXPERIENCE_TASKS.get(code) or {})
+    official_id = experience_expert_id(task.get("jump_url"))
+    if official_id:
+        spec["id"] = official_id
+        spec["version"] = ""
+    keyword = spec.get("profession") or spec.get("name") or str(task.get("title") or "")
+    expected = spec.get("id", "")
+    matches = {}
+    for page in range(1, 4):
+        try:
+            response = s.post("https://www.codebuddy.cn/v2/operation-platform/market/expert/list",
+                              json={"page": page, "page_size": 20, "keyword": keyword},
+                              timeout=20, verify=False)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") not in (0, None):
+                break
+            data = payload.get("data") or {}
+            rows = data.get("experts") or data.get("items") or []
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                eid = row.get("expert_id") or row.get("source_id") or row.get("id")
+                name = _extract_name(row.get("display_name_zh") or row.get("displayName") or row.get("name") or "")
+                profession = _extract_name(row.get("profession_zh") or row.get("profession") or "")
+                meta = row.get("_meta") or {}
+                version = str(row.get("version") or (meta.get("version") if isinstance(meta, dict) else "") or "")
+                candidate = {"id": eid, "name": name or keyword, "profession": profession or keyword, "version": version}
+                if expected and eid == expected:
+                    spec.update(candidate)
+                    return spec
+                if not expected and keyword and keyword in (name, profession):
+                    matches[eid] = candidate
+            if len(rows) < 20:
+                break
+        except Exception:
+            break
+    if not expected and len(matches) == 1:
+        spec.update(next(iter(matches.values())))
+    import re
+    if not re.fullmatch(r"ex_[A-Za-z0-9]{6,64}", str(spec.get("id") or "")):
+        return None
+    spec.setdefault("name", keyword)
+    spec.setdefault("profession", keyword)
+    spec.setdefault("version", "")
+    return spec
+
+
+def experience_expert_chat(s, expert, uid):
+    """独立 SSE 对话，不改旧 webchat 返回值；只返回真实完成的回复与消息 ID。"""
+    prompt = "请结合你的专长，给初次使用者三条具体建议，每条一句话。"
+    model = os.environ.get("WORKBUDDY_EXPERT_MODEL", "glm-5.2").strip() or "glm-5.2"
+    response = s.post(BASE + "/console/webchat/conversations",
+                      json={"name": "expert-experience-" + uuid.uuid4().hex[:8]},
+                      timeout=20, verify=False)
+    response.raise_for_status()
+    body = response.json()
+    if body.get("code") not in (0, None):
+        return None
+    cid = (body.get("data") or {}).get("conversationId")
+    if not isinstance(cid, str) or not cid:
+        return None
+    growth = [{"eventCode": "ExpertActualUse", "id": expert["id"], "expertType": "agent",
+               "extra": {"name": expert["name"], "expertTitle": expert.get("profession", ""),
+                         "expertType": "agent", "source": "builtin", "version": expert["version"],
+                         "characterCount": len(prompt)}}]
+    request_id = str(uuid.uuid4())
+    meta = {"codebuddy.ai": {"growthEvent": json.dumps(growth, ensure_ascii=False),
+                            "promptRequestId": request_id, "clientSendTime": int(time.time() * 1000),
+                            "userId": uid, "mode": "LOCAL", "model": model, "expertId": expert["id"],
+                            "expert": {"id": expert["id"], "name": expert["name"], "prompt": prompt},
+                            "tags": ["expert:" + expert["id"]]}}
+    payload = {"messages": [{"role": "user", "content": prompt}], "model": model,
+               "stream": True, "conversationId": cid, "_meta": meta}
+    headers = dict(s.headers)
+    headers["Accept"] = "text/event-stream"
+    text, mid, finished = "", "", False
+    with s.post(BASE + "/console/chat/completions", json=payload, headers=headers,
+                stream=True, timeout=90, verify=False) as response:
+        response.raise_for_status()
+        for line in response.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if raw in ("[DONE]", "[完成]", "[✅完成]"):
+                finished = True
+                break
+            try:
+                chunk = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error") or chunk.get("code") not in (0, None):
+                return None
+            if isinstance(chunk.get("id"), str) and chunk["id"]:
+                mid = mid or chunk["id"]
+            for choice in chunk.get("choices") or []:
+                delta = (choice.get("delta") or {}).get("content")
+                if isinstance(delta, str):
+                    text += delta
+                if choice.get("finish_reason") in ("stop", "length"):
+                    finished = True
+    if not (finished and text.strip() and mid):
+        return None
+    return {"conversationId": cid, "messageId": mid, "requestId": request_id,
+            "text": text, "prompt": prompt, "model": model}
+
+
+def t_expert_experience_tasks(s, uid, nick, log):
+    """补齐六个指定专家任务；未知 expert_use_* 无法确认专家时跳过。"""
+    try:
+        response = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") not in (0, None):
+            log("   专家体验: 任务列表业务失败，跳过")
+            return
+        tasks = (payload.get("data") or {}).get("tasks") or []
+    except Exception:
+        log("   专家体验: 无法读取任务列表，跳过")
+        return
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        code = task.get("task_code", "")
+        if code not in EXPERT_EXPERIENCE_TASKS and not code.startswith("expert_use_"):
+            continue
+        try:
+            available, reason = experience_task_available(task)
+            if not available:
+                log("   专家体验[%s]: %s，跳过" % (code, reason))
+                continue
+            # accept 必须成功；不在未登记、未知状态下产生对话费用。
+            status, _, _ = prog(s, code)
+            if status in ("completed", "claimed"):
+                continue
+            if status in (None, "not_accepted"):
+                response = s.post(BASE + "/v2/activity/growth/tasks/accept",
+                                  json={"task_codes": [code]}, timeout=20, verify=False)
+                response.raise_for_status()
+                if response.json().get("code") not in (0, None):
+                    log("   专家体验[%s]: 接受任务失败，跳过" % code)
+                    continue
+                status, _, _ = prog(s, code)
+            if status in (None, "not_accepted"):
+                log("   专家体验[%s]: 登记状态未确认，跳过" % code)
+                continue
+            if status in ("completed", "claimed"):
+                continue
+            expert = resolve_experience_expert(s, task)
+            if not expert:
+                log("   专家体验[%s]: 无法确认专家 ID，保留人工处理" % code)
+                continue
+            chat = experience_expert_chat(s, expert, uid)
+            if not chat:
+                log("   专家体验[%s]: 无完整对话或服务端消息 ID，不上报完成事件" % code)
+                continue
+            # LOCAL 是这些指定专家任务使用的场景路由；不模拟桌面设备或虚构会话。
+            report(s, uid, nick, [{"eventCode": "expert_actual_use", "id": expert["id"],
+                "name": expert["name"], "expertTitle": expert.get("profession", ""),
+                "type": "", "expertType": "agent", "source": "builtin", "version": expert["version"],
+                "mode": "LOCAL", "characterCount": len(chat["prompt"]),
+                "conversationId": chat["conversationId"], "requestId": chat["messageId"],
+                "messageId": chat["messageId"], "requestModelId": chat["model"],
+                "requestModelName": chat["model"]}])
+            # 服务端计分可能异步；有限轮询，不重复发送对话或强行领奖。
+            for delay in (2, 4, 6):
+                time.sleep(delay)
+                status, current, target = prog(s, code)
+                if status in ("completed", "claimed"):
+                    log("   专家体验[%s]: %s %s/%s，后续统一领奖" % (code, status, current, target))
+                    break
+            else:
+                log("   专家体验[%s]: 对话已完成，服务端尚未确认任务达标，%s %s/%s；可能要求桌面端体验" %
+                    (code, status, current, target))
+        except Exception as exc:
+            # 不输出响应正文、请求头或 Token。
+            log("   专家体验[%s]: %s，继续其他任务" % (code, type(exc).__name__))
+
+
+
 def t_unknown_tasks(s, uid, nick, log):
     """检测脚本未覆盖的新任务，明确提示"""
     known = {"create_canvas", "playbook_prompt", "RichMeow_Chat", "Library_read", "Expert_lighthouse",
              "Expert_Philanthropy", "Hp_Appearance", "Buddy_App", "Buddy_App_QQ", "Model_chat_GLM5.2",
              "black_cat", "Expert_team_use_3", "first_buddy", "chat_5", "skill_1", "expert_5",
              "template_5", "automation_1", "workstation_expert"}
+    known.update(EXPERT_EXPERIENCE_TASKS)
     r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
     for t in r.get("data", {}).get("tasks", []):
         if not isinstance(t, dict):
             continue
         code = t.get("task_code", "")
         st = t.get("accept_status", "")
-        if code in known or st in ("claimed", "completed"):
+        if code in known or code.startswith("expert_use_") or st in ("claimed", "completed"):
             continue
         desc = t.get("task_desc", "")[:50]
         if "subscribe" in code.lower() or "公众号" in (t.get("title", "") + desc):
@@ -1343,6 +1606,7 @@ def run_account(idx, acc, do_desktop):
     t_library(s, uid, nick, log)
     t_canvas_automation(s, uid, nick, log)
     t_expert_5(s, uid, nick, log)
+    t_expert_experience_tasks(s, uid, nick, log)
     t_template_5(s, uid, nick, log)
     t_glm52(s, uid, nick, log)
     t_black_cat(s, uid, nick, log)
